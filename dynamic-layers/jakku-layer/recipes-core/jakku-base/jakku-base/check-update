@@ -1,0 +1,146 @@
+#!/bin/sh
+
+exec </dev/console
+exec >/dev/console
+exec 2>/dev/console
+
+source /etc/env
+
+ZIPFILE="${1}"
+RWDIR="/tmp"
+UPDATEDIR="${RWDIR}/N"
+
+STATUSLOG="/var/log/update"
+ERRORLOG="/var/log/update_error"
+PERCENTLOG="/var/log/update_percent"
+
+KERNEL="fitImage"
+ROOTFS="rootfs"
+
+log_info()
+{
+    local STAMP=$(date +"%F %T")
+    echo "[$STAMP] ${1}" >&2
+    echo "[$STAMP] ${1}" >> ${STATUSLOG}
+    sync
+}
+
+log_error()
+{
+    log_info "ERROR : ${1}"
+    
+    local STAMP=$(date +"%F %T")
+    echo "[$STAMP] ERROR : ${1}" >&2
+    echo "[$STAMP] ERROR : ${1}" >> ${ERRORLOG}
+    sync
+    exit 1
+}
+
+percent_info()
+{
+
+    log_info "${1} %"
+    echo "${1}" > ${PERCENTLOG}
+    sync
+}
+
+percent_info "0"
+log_info "Starting update."
+
+rm -rf ${UPDATEDIR}
+rm -f ${STATUSLOG}
+rm -f ${ERRORLOG}
+rm -f ${PERCENTLOG}
+
+touch ${STATUSLOG}
+touch ${ERRORLOG}
+touch ${PERCENTLOG}
+
+sync
+
+percent_info "0"
+log_info "Stopping application."
+/usr/bin/haltapp update ${STATUSLOG} ${ERRORLOG} ${PERCENTLOG}
+
+sleep 2
+
+percent_info "10"
+log_info "Checking actual system."
+ACTUALSYSTEM=$(fw_printenv | grep "system=" | cut -f2 -d=)
+TARGETSYSTEM=""
+
+if [ "$ACTUALSYSTEM" == "A" ] ; then
+    TARGETSYSTEM="B"
+elif [ "$ACTUALSYSTEM" == "B" ] ; then
+    TARGETSYSTEM="A"
+else
+    log_error "Can't read actual system."
+fi
+
+percent_info "20"
+log_info "Check for free storage."
+if [ "$(df ${RWDIR} | tail -n 1 | tr -s ' ' | cut -f4 -d' ')" -lt 30720 ] ; then
+    log_error "Update requires at least 30 MiB of free storage space."
+fi
+
+percent_info "30"
+log_info "Unpacking ${ZIPFILE}."
+mkdir -p ${UPDATEDIR}
+unzip -q "${ZIPFILE}" -d ${UPDATEDIR}
+if [ $? -ne 0 ]; then
+    log_error "Update file corrupt."
+fi
+
+percent_info "40"
+log_info "Checking md5sums."
+for FILE in $(find ${UPDATEDIR} -type f ! -name '*.md5sum'); do
+    NAME=$(basename "${FILE}")
+    MD5SUM=$(md5sum "${FILE}" | tr -s ' ' | cut -f1 -d' ')
+    if [ "${MD5SUM}" != "$(cat ${FILE}.md5sum)" ] ; then
+        log_error "Update file corrupt (md5sum $NAME)."
+    fi
+done
+rm -r ${UPDATEDIR}/*.md5sum
+
+percent_info "50"
+log_info "Checking for missing files."
+for NAME in ${KERNEL} ${ROOTFS}; do
+    if [ ! -f ${UPDATEDIR}/${NAME} ]; then
+        log_error "Update file incomplete (missing $NAME)."
+    fi
+done
+
+percent_info "60"
+log_info "Install to system: ${TARGETSYSTEM}"
+
+MTD_KERNEL="/dev/"$(cat /proc/mtd | grep kernel | cut -f1 -d ':')
+/usr/sbin/flash_erase ${MTD_KERNEL} 0 0
+/usr/sbin/nandwrite -p -m ${MTD_KERNEL} ${UPDATEDIR}/${KERNEL}
+
+KLENGHT=$(printf '0x%x' $(/usr/bin/wc -c ${UPDATEDIR}/${KERNEL} | cut -f0 -d ' '))
+
+percent_info "80"
+log_info "Install to system: ${TARGETSYSTEM}"
+
+MTD_ROOTFS="/dev/"$(cat /proc/mtd | grep root${TARGETSYSTEM} | cut -f1 -d ':')
+ubiattach -p ${MTD_ROOTFS}
+ubiupdatevol /dev/ubi1_0 ${UPDATEDIR}/${ROOTFS}
+
+sync 
+
+if [ -x /usr/bin/fw_setenv ] ; then
+    percent_info "90"
+    log_info "Switch system"
+    /usr/bin/fw_setenv system ${TARGETSYSTEM} klength ${KLENGHT}
+else
+    log_error "Can't switch the system"
+fi
+
+sync
+
+log_info "Rebooting system"
+percent_info "100"
+sync
+sleep 1
+reboot -f
+sleep 60

@@ -1,0 +1,29 @@
+#!/bin/sh
+
+ifconfig lo 127.0.0.1 &
+
+if [ -x /usr/sbin/dropbear ] ; then
+    /usr/sbin/dropbear -B
+fi
+
+if [ -x /sbin/watch-update ] ; then
+    /sbin/watch-update &
+fi
+
+#
+# Loop over every line in /etc/modules.
+#
+echo -n 'Loading modules:'
+(cat /etc/modules; echo) | # make sure there is a LF at the end
+while read module args
+do
+	case "$module" in
+	\#*|"") continue ;;
+	esac
+
+	echo -n " $module"
+	modprobe "$module.ko" $args
+done
+
+wpa_supplicant -B -c/etc/wpa_supplicant.conf -i wlan0
+sleep 3 && dhclient -i wlan0 &
